@@ -4,6 +4,7 @@ on:
     branches:
       - main
       - '*.x'
+      - python3.10
     paths-ignore:
       - 'docs/**'
       - '*.md'
