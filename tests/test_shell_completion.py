@@ -1,9 +1,13 @@
+import warnings
+
 import pytest
 
+import click.shell_completion
 from click.core import Argument
 from click.core import Command
 from click.core import Group
 from click.core import Option
+from click.shell_completion import add_completion_class
 from click.shell_completion import CompletionItem
 from click.shell_completion import ShellComplete
 from click.types import Choice
@@ -110,6 +114,45 @@ def test_type_choice():
     assert _get_words(cli, ["-c"], "a2") == ["a2"]
 
 
+def test_choice_special_characters():
+    cli = Command("cli", params=[Option(["-c"], type=Choice(["!1", "!2", "+3"]))])
+    assert _get_words(cli, ["-c"], "") == ["!1", "!2", "+3"]
+    assert _get_words(cli, ["-c"], "!") == ["!1", "!2"]
+    assert _get_words(cli, ["-c"], "!2") == ["!2"]
+
+
+def test_choice_conflicting_prefix():
+    cli = Command(
+        "cli",
+        params=[
+            Option(["-c"], type=Choice(["!1", "!2", "+3"])),
+            Option(["+p"], is_flag=True),
+        ],
+    )
+    assert _get_words(cli, ["-c"], "") == ["!1", "!2", "+3"]
+    assert _get_words(cli, ["-c"], "+") == ["+p"]
+
+
+def test_option_count():
+    cli = Command("cli", params=[Option(["-c"], count=True)])
+    assert _get_words(cli, ["-c"], "") == []
+    assert _get_words(cli, ["-c"], "-") == ["--help"]
+
+
+def test_option_optional():
+    cli = Command(
+        "cli",
+        add_help_option=False,
+        params=[
+            Option(["--name"], is_flag=False, flag_value="value"),
+            Option(["--flag"], is_flag=True),
+        ],
+    )
+    assert _get_words(cli, ["--name"], "") == []
+    assert _get_words(cli, ["--name"], "-") == ["--flag"]
+    assert _get_words(cli, ["--name", "--flag"], "-") == []
+
+
 @pytest.mark.parametrize(
     ("type", "expect"),
     [(File(), "file"), (Path(), "file"), (Path(file_okay=False), "dir")],
@@ -159,20 +202,6 @@ def test_option_custom():
     )
     assert _get_words(cli, ["a", "b"], "") == [""]
     assert _get_words(cli, ["a", "b"], "c") == ["C"]
-
-
-def test_autocompletion_deprecated():
-    # old function takes args and not param, returns all values, can mix
-    # strings and tuples
-    def custom(ctx, args, incomplete):
-        assert isinstance(args, list)
-        return [("art", "x"), "bat", "cat"]
-
-    with pytest.deprecated_call():
-        cli = Command("cli", params=[Argument(["x"], autocompletion=custom)])
-
-    assert _get_words(cli, [], "") == ["art", "bat", "cat"]
-    assert _get_words(cli, [], "c") == ["cat"]
 
 
 def test_option_multiple():
@@ -317,3 +346,97 @@ def test_choice_case_sensitive(value, expect):
     )
     completions = _get_words(cli, ["-a"], "a")
     assert completions == expect
+
+
+@pytest.fixture()
+def _restore_available_shells(tmpdir):
+    prev_available_shells = click.shell_completion._available_shells.copy()
+    click.shell_completion._available_shells.clear()
+    yield
+    click.shell_completion._available_shells.clear()
+    click.shell_completion._available_shells.update(prev_available_shells)
+
+
+@pytest.mark.usefixtures("_restore_available_shells")
+def test_add_completion_class():
+    # At first, "mysh" is not in available shells
+    assert "mysh" not in click.shell_completion._available_shells
+
+    class MyshComplete(ShellComplete):
+        name = "mysh"
+        source_template = "dummy source"
+
+    # "mysh" still not in available shells because it is not registered
+    assert "mysh" not in click.shell_completion._available_shells
+
+    # Adding a completion class should return that class
+    assert add_completion_class(MyshComplete) is MyshComplete
+
+    # Now, "mysh" is finally in available shells
+    assert "mysh" in click.shell_completion._available_shells
+    assert click.shell_completion._available_shells["mysh"] is MyshComplete
+
+
+@pytest.mark.usefixtures("_restore_available_shells")
+def test_add_completion_class_with_name():
+    # At first, "mysh" is not in available shells
+    assert "mysh" not in click.shell_completion._available_shells
+    assert "not_mysh" not in click.shell_completion._available_shells
+
+    class MyshComplete(ShellComplete):
+        name = "not_mysh"
+        source_template = "dummy source"
+
+    # "mysh" and "not_mysh" are still not in available shells because
+    # it is not registered yet
+    assert "mysh" not in click.shell_completion._available_shells
+    assert "not_mysh" not in click.shell_completion._available_shells
+
+    # Adding a completion class should return that class.
+    # Because we are using the "name" parameter, the name isn't taken
+    # from the class.
+    assert add_completion_class(MyshComplete, name="mysh") is MyshComplete
+
+    # Now, "mysh" is finally in available shells
+    assert "mysh" in click.shell_completion._available_shells
+    assert "not_mysh" not in click.shell_completion._available_shells
+    assert click.shell_completion._available_shells["mysh"] is MyshComplete
+
+
+@pytest.mark.usefixtures("_restore_available_shells")
+def test_add_completion_class_decorator():
+    # At first, "mysh" is not in available shells
+    assert "mysh" not in click.shell_completion._available_shells
+
+    @add_completion_class
+    class MyshComplete(ShellComplete):
+        name = "mysh"
+        source_template = "dummy source"
+
+    # Using `add_completion_class` as a decorator adds the new shell immediately
+    assert "mysh" in click.shell_completion._available_shells
+    assert click.shell_completion._available_shells["mysh"] is MyshComplete
+
+
+# Don't make the ResourceWarning give an error
+@pytest.mark.filterwarnings("default")
+def test_files_closed(runner) -> None:
+    with runner.isolated_filesystem():
+        config_file = "foo.txt"
+        with open(config_file, "w") as f:
+            f.write("bar")
+
+        @click.group()
+        @click.option(
+            "--config-file",
+            default=config_file,
+            type=click.File(mode="r"),
+        )
+        @click.pass_context
+        def cli(ctx, config_file):
+            pass
+
+        with warnings.catch_warnings(record=True) as current_warnings:
+            assert not current_warnings, "There should be no warnings to start"
+            _get_completions(cli, args=[], incomplete="")
+            assert not current_warnings, "There should be no warnings after either"

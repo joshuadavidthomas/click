@@ -68,13 +68,17 @@ usage patterns.
 
    why
    quickstart
+   entry-points
+   virtualenv
    setuptools
    parameters
+   parameter-types
    options
+   option-decorators
    arguments
    commands
-   prompts
    documentation
+   prompts
    complex
    advanced
    testing
@@ -102,6 +106,5 @@ Miscellaneous Pages
    :maxdepth: 2
 
    contrib
-   upgrading
    license
    changes

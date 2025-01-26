@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 import click
 
 
@@ -93,13 +95,9 @@ def test_auto_shorthelp(runner):
     )
 
 
-def test_no_args_is_help(runner):
-    @click.command(no_args_is_help=True)
-    def cli():
-        pass
-
-    result = runner.invoke(cli, [])
-    assert result.exit_code == 0
+def test_command_no_args_is_help(runner):
+    result = runner.invoke(click.Command("test", no_args_is_help=True))
+    assert result.exit_code == 2
     assert "Show this message and exit." in result.output
 
 
@@ -119,7 +117,16 @@ def test_default_maps(runner):
     assert result.output == "changed\n"
 
 
-def test_group_with_args(runner):
+@pytest.mark.parametrize(
+    ("args", "exit_code", "expect"),
+    [
+        (["obj1"], 2, "Error: Missing command."),
+        (["obj1", "--help"], 0, "Show this message and exit."),
+        (["obj1", "move"], 0, "obj=obj1\nmove\n"),
+        ([], 2, "Show this message and exit."),
+    ],
+)
+def test_group_with_args(runner, args, exit_code, expect):
     @click.group()
     @click.argument("obj")
     def cli(obj):
@@ -129,31 +136,19 @@ def test_group_with_args(runner):
     def move():
         click.echo("move")
 
-    result = runner.invoke(cli, [])
-    assert result.exit_code == 0
-    assert "Show this message and exit." in result.output
-
-    result = runner.invoke(cli, ["obj1"])
-    assert result.exit_code == 2
-    assert "Error: Missing command." in result.output
-
-    result = runner.invoke(cli, ["obj1", "--help"])
-    assert result.exit_code == 0
-    assert "Show this message and exit." in result.output
-
-    result = runner.invoke(cli, ["obj1", "move"])
-    assert result.exit_code == 0
-    assert result.output == "obj=obj1\nmove\n"
+    result = runner.invoke(cli, args)
+    assert result.exit_code == exit_code
+    assert expect in result.output
 
 
-def test_base_command(runner):
+def test_custom_parser(runner):
     import optparse
 
     @click.group()
     def cli():
         pass
 
-    class OptParseCommand(click.BaseCommand):
+    class OptParseCommand(click.Command):
         def __init__(self, name, parser, callback):
             super().__init__(name)
             self.parser = parser
@@ -196,18 +191,12 @@ def test_base_command(runner):
 
     cli.add_command(OptParseCommand("test", parser, test_callback))
 
-    result = runner.invoke(
-        cli, ["test", "-f", "test.txt", "-q", "whatever.txt", "whateverelse.txt"]
-    )
-    assert not result.exception
-    assert result.output.splitlines() == [
-        "whatever.txt whateverelse.txt",
-        "test.txt",
-        "False",
-    ]
+    result = runner.invoke(cli, ["test", "-f", "f.txt", "-q", "q1.txt", "q2.txt"])
+    assert result.exception is None
+    assert result.output.splitlines() == ["q1.txt q2.txt", "f.txt", "False"]
 
     result = runner.invoke(cli, ["test", "--help"])
-    assert not result.exception
+    assert result.exception is None
     assert result.output.splitlines() == [
         "Usage: foo test [OPTIONS]",
         "",
@@ -246,15 +235,17 @@ def test_other_command_invoke_with_defaults(runner):
         return ctx.invoke(other_cmd)
 
     @click.command()
-    @click.option("--foo", type=click.INT, default=42)
+    @click.option("-a", type=click.INT, default=42)
+    @click.option("-b", type=click.INT, default="15")
+    @click.option("-c", multiple=True)
     @click.pass_context
-    def other_cmd(ctx, foo):
-        assert ctx.info_name == "other-cmd"
-        click.echo(foo)
+    def other_cmd(ctx, a, b, c):
+        return ctx.info_name, a, b, c
 
-    result = runner.invoke(cli, [])
-    assert not result.exception
-    assert result.output == "42\n"
+    result = runner.invoke(cli, standalone_mode=False)
+    # invoke should type cast default values, str becomes int, empty
+    # multiple should be empty tuple instead of None
+    assert result.return_value == ("other", 42, 15, ())
 
 
 def test_invoked_subcommand(runner):
@@ -326,27 +317,99 @@ def test_unprocessed_options(runner):
     ]
 
 
-def test_deprecated_in_help_messages(runner):
-    @click.command(deprecated=True)
-    def cmd_with_help():
-        """CLI HELP"""
+@pytest.mark.parametrize("doc", ["CLI HELP", None])
+@pytest.mark.parametrize("deprecated", [True, "USE OTHER COMMAND INSTEAD"])
+def test_deprecated_in_help_messages(runner, doc, deprecated):
+    @click.command(deprecated=deprecated, help=doc)
+    def cli():
         pass
 
-    result = runner.invoke(cmd_with_help, ["--help"])
-    assert "(Deprecated)" in result.output
+    result = runner.invoke(cli, ["--help"])
+    assert "(DEPRECATED" in result.output
 
-    @click.command(deprecated=True)
-    def cmd_without_help():
-        pass
-
-    result = runner.invoke(cmd_without_help, ["--help"])
-    assert "(Deprecated)" in result.output
+    if isinstance(deprecated, str):
+        assert deprecated in result.output
 
 
-def test_deprecated_in_invocation(runner):
-    @click.command(deprecated=True)
+@pytest.mark.parametrize("deprecated", [True, "USE OTHER COMMAND INSTEAD"])
+def test_deprecated_in_invocation(runner, deprecated):
+    @click.command(deprecated=deprecated)
     def deprecated_cmd():
         pass
 
     result = runner.invoke(deprecated_cmd)
     assert "DeprecationWarning:" in result.output
+
+    if isinstance(deprecated, str):
+        assert deprecated in result.output
+
+
+def test_command_parse_args_collects_option_prefixes():
+    @click.command()
+    @click.option("+p", is_flag=True)
+    @click.option("!e", is_flag=True)
+    def test(p, e):
+        pass
+
+    ctx = click.Context(test)
+    test.parse_args(ctx, [])
+
+    assert ctx._opt_prefixes == {"-", "--", "+", "!"}
+
+
+def test_group_parse_args_collects_base_option_prefixes():
+    @click.group()
+    @click.option("~t", is_flag=True)
+    def group(t):
+        pass
+
+    @group.command()
+    @click.option("+p", is_flag=True)
+    def command1(p):
+        pass
+
+    @group.command()
+    @click.option("!e", is_flag=True)
+    def command2(e):
+        pass
+
+    ctx = click.Context(group)
+    group.parse_args(ctx, ["command1", "+p"])
+
+    assert ctx._opt_prefixes == {"-", "--", "~"}
+
+
+def test_group_invoke_collects_used_option_prefixes(runner):
+    opt_prefixes = set()
+
+    @click.group()
+    @click.option("~t", is_flag=True)
+    def group(t):
+        pass
+
+    @group.command()
+    @click.option("+p", is_flag=True)
+    @click.pass_context
+    def command1(ctx, p):
+        nonlocal opt_prefixes
+        opt_prefixes = ctx._opt_prefixes
+
+    @group.command()
+    @click.option("!e", is_flag=True)
+    def command2(e):
+        pass
+
+    runner.invoke(group, ["command1"])
+    assert opt_prefixes == {"-", "--", "~", "+"}
+
+
+@pytest.mark.parametrize("exc", (EOFError, KeyboardInterrupt))
+def test_abort_exceptions_with_disabled_standalone_mode(runner, exc):
+    @click.command()
+    def cli():
+        raise exc("catch me!")
+
+    rv = runner.invoke(cli, standalone_mode=False)
+    assert rv.exit_code == 1
+    assert isinstance(rv.exception.__cause__, exc)
+    assert rv.exception.__cause__.args == ("catch me!",)

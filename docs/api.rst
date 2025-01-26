@@ -63,8 +63,6 @@ Utilities
 
 .. autofunction:: pause
 
-.. autofunction:: get_terminal_size
-
 .. autofunction:: get_binary_stream
 
 .. autofunction:: get_text_stream
@@ -115,6 +113,7 @@ Context
     :members:
     :member-order: bysource
 
+.. _click-api-types:
 
 Types
 -----
@@ -136,6 +135,7 @@ Types
 .. autoclass:: Path
 
 .. autoclass:: Choice
+   :members:
 
 .. autoclass:: IntRange
 

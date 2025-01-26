@@ -3,6 +3,10 @@ This module contains implementations for the termui module. To keep the
 import time of Click down, some infrequently used functionality is
 placed in this module and only imported as needed.
 """
+
+from __future__ import annotations
+
+import collections.abc as cabc
 import contextlib
 import math
 import os
@@ -10,6 +14,8 @@ import sys
 import time
 import typing as t
 from gettext import gettext as _
+from io import StringIO
+from types import TracebackType
 
 from ._compat import _default_text_stdout
 from ._compat import CYGWIN
@@ -35,19 +41,20 @@ else:
 class ProgressBar(t.Generic[V]):
     def __init__(
         self,
-        iterable: t.Optional[t.Iterable[V]],
-        length: t.Optional[int] = None,
+        iterable: cabc.Iterable[V] | None,
+        length: int | None = None,
         fill_char: str = "#",
         empty_char: str = " ",
         bar_template: str = "%(bar)s",
         info_sep: str = "  ",
+        hidden: bool = False,
         show_eta: bool = True,
-        show_percent: t.Optional[bool] = None,
+        show_percent: bool | None = None,
         show_pos: bool = False,
-        item_show_func: t.Optional[t.Callable[[t.Optional[V]], t.Optional[str]]] = None,
-        label: t.Optional[str] = None,
-        file: t.Optional[t.TextIO] = None,
-        color: t.Optional[bool] = None,
+        item_show_func: t.Callable[[V | None], str | None] | None = None,
+        label: str | None = None,
+        file: t.TextIO | None = None,
+        color: bool | None = None,
         update_min_steps: int = 1,
         width: int = 30,
     ) -> None:
@@ -55,19 +62,27 @@ class ProgressBar(t.Generic[V]):
         self.empty_char = empty_char
         self.bar_template = bar_template
         self.info_sep = info_sep
+        self.hidden = hidden
         self.show_eta = show_eta
         self.show_percent = show_percent
         self.show_pos = show_pos
         self.item_show_func = item_show_func
-        self.label = label or ""
+        self.label: str = label or ""
+
         if file is None:
             file = _default_text_stdout()
+
+            # There are no standard streams attached to write to. For example,
+            # pythonw on Windows.
+            if file is None:
+                file = StringIO()
+
         self.file = file
         self.color = color
         self.update_min_steps = update_min_steps
         self._completed_intervals = 0
-        self.width = width
-        self.autowidth = width == 0
+        self.width: int = width
+        self.autowidth: bool = width == 0
 
         if length is None:
             from operator import length_hint
@@ -79,29 +94,36 @@ class ProgressBar(t.Generic[V]):
         if iterable is None:
             if length is None:
                 raise TypeError("iterable or length is required")
-            iterable = t.cast(t.Iterable[V], range(length))
-        self.iter = iter(iterable)
+            iterable = t.cast("cabc.Iterable[V]", range(length))
+        self.iter: cabc.Iterable[V] = iter(iterable)
         self.length = length
         self.pos = 0
-        self.avg: t.List[float] = []
+        self.avg: list[float] = []
+        self.last_eta: float
+        self.start: float
         self.start = self.last_eta = time.time()
-        self.eta_known = False
-        self.finished = False
-        self.max_width: t.Optional[int] = None
-        self.entered = False
-        self.current_item: t.Optional[V] = None
-        self.is_hidden = not isatty(self.file)
-        self._last_line: t.Optional[str] = None
+        self.eta_known: bool = False
+        self.finished: bool = False
+        self.max_width: int | None = None
+        self.entered: bool = False
+        self.current_item: V | None = None
+        self._is_atty = isatty(self.file)
+        self._last_line: str | None = None
 
-    def __enter__(self) -> "ProgressBar":
+    def __enter__(self) -> ProgressBar[V]:
         self.entered = True
         self.render_progress()
         return self
 
-    def __exit__(self, exc_type, exc_value, tb):  # type: ignore
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.render_finish()
 
-    def __iter__(self) -> t.Iterator[V]:
+    def __iter__(self) -> cabc.Iterator[V]:
         if not self.entered:
             raise RuntimeError("You need to use progress bars in a with block.")
         self.render_progress()
@@ -116,7 +138,7 @@ class ProgressBar(t.Generic[V]):
         return next(iter(self))
 
     def render_finish(self) -> None:
-        if self.is_hidden:
+        if self.hidden or not self._is_atty:
             return
         self.file.write(AFTER_BAR)
         self.file.flush()
@@ -212,13 +234,14 @@ class ProgressBar(t.Generic[V]):
     def render_progress(self) -> None:
         import shutil
 
-        if self.is_hidden:
-            # Only output the label as it changes if the output is not a
-            # TTY. Use file=stderr if you expect to be piping stdout.
+        if self.hidden:
+            return
+
+        if not self._is_atty:
+            # Only output the label once if the output is not a TTY.
             if self._last_line != self.label:
                 self._last_line = self.label
                 echo(self.label, file=self.file, color=self.color)
-
             return
 
         buf = []
@@ -228,9 +251,9 @@ class ProgressBar(t.Generic[V]):
             self.width = 0
             clutter_length = term_len(self.format_progress_line())
             new_width = max(0, shutil.get_terminal_size().columns - clutter_length)
-            if new_width < old_width:
+            if new_width < old_width and self.max_width is not None:
                 buf.append(BEFORE_BAR)
-                buf.append(" " * self.max_width)  # type: ignore
+                buf.append(" " * self.max_width)
                 self.max_width = new_width
             self.width = new_width
 
@@ -276,7 +299,7 @@ class ProgressBar(t.Generic[V]):
 
         self.eta_known = self.length is not None
 
-    def update(self, n_steps: int, current_item: t.Optional[V] = None) -> None:
+    def update(self, n_steps: int, current_item: V | None = None) -> None:
         """Update the progress bar by advancing a specified number of
         steps, and optionally set the ``current_item`` for this new
         position.
@@ -307,7 +330,7 @@ class ProgressBar(t.Generic[V]):
         self.current_item = None
         self.finished = True
 
-    def generator(self) -> t.Iterator[V]:
+    def generator(self) -> cabc.Iterator[V]:
         """Return a generator which yields the items added to the bar
         during construction, and updates the progress bar *after* the
         yielded block returns.
@@ -322,7 +345,7 @@ class ProgressBar(t.Generic[V]):
         if not self.entered:
             raise RuntimeError("You need to use progress bars in a with block.")
 
-        if self.is_hidden:
+        if not self._is_atty:
             yield from self.iter
         else:
             for rv in self.iter:
@@ -341,9 +364,15 @@ class ProgressBar(t.Generic[V]):
             self.render_progress()
 
 
-def pager(generator: t.Iterable[str], color: t.Optional[bool] = None) -> None:
+def pager(generator: cabc.Iterable[str], color: bool | None = None) -> None:
     """Decide what method to use for paging through text."""
     stdout = _default_text_stdout()
+
+    # There are no standard streams attached to write to. For example,
+    # pythonw on Windows.
+    if stdout is None:
+        stdout = StringIO()
+
     if not isatty(sys.stdin) or not isatty(stdout):
         return _nullpager(stdout, generator, color)
     pager_cmd = (os.environ.get("PAGER", None) or "").strip()
@@ -370,7 +399,7 @@ def pager(generator: t.Iterable[str], color: t.Optional[bool] = None) -> None:
         os.unlink(filename)
 
 
-def _pipepager(generator: t.Iterable[str], cmd: str, color: t.Optional[bool]) -> None:
+def _pipepager(generator: cabc.Iterable[str], cmd: str, color: bool | None) -> None:
     """Page through text by feeding it to another program.  Invoking a
     pager through this might support colors.
     """
@@ -398,31 +427,43 @@ def _pipepager(generator: t.Iterable[str], cmd: str, color: t.Optional[bool]) ->
                 text = strip_ansi(text)
 
             stdin.write(text.encode(encoding, "replace"))
-    except (OSError, KeyboardInterrupt):
+    except BrokenPipeError:
+        # In case the pager exited unexpectedly, ignore the broken pipe error.
         pass
-    else:
-        stdin.close()
-
-    # Less doesn't respect ^C, but catches it for its own UI purposes (aborting
-    # search or other commands inside less).
-    #
-    # That means when the user hits ^C, the parent process (click) terminates,
-    # but less is still alive, paging the output and messing up the terminal.
-    #
-    # If the user wants to make the pager exit on ^C, they should set
-    # `LESS='-K'`. It's not our decision to make.
-    while True:
+    except Exception as e:
+        # In case there is an exception we want to close the pager immediately
+        # and let the caller handle it.
+        # Otherwise the pager will keep running, and the user may not notice
+        # the error message, or worse yet it may leave the terminal in a broken state.
+        c.terminate()
+        raise e
+    finally:
+        # We must close stdin and wait for the pager to exit before we continue
         try:
-            c.wait()
-        except KeyboardInterrupt:
+            stdin.close()
+        # Close implies flush, so it might throw a BrokenPipeError if the pager
+        # process exited already.
+        except BrokenPipeError:
             pass
-        else:
-            break
+
+        # Less doesn't respect ^C, but catches it for its own UI purposes (aborting
+        # search or other commands inside less).
+        #
+        # That means when the user hits ^C, the parent process (click) terminates,
+        # but less is still alive, paging the output and messing up the terminal.
+        #
+        # If the user wants to make the pager exit on ^C, they should set
+        # `LESS='-K'`. It's not our decision to make.
+        while True:
+            try:
+                c.wait()
+            except KeyboardInterrupt:
+                pass
+            else:
+                break
 
 
-def _tempfilepager(
-    generator: t.Iterable[str], cmd: str, color: t.Optional[bool]
-) -> None:
+def _tempfilepager(generator: cabc.Iterable[str], cmd: str, color: bool | None) -> None:
     """Page through text by invoking a program on a temporary file."""
     import tempfile
 
@@ -442,7 +483,7 @@ def _tempfilepager(
 
 
 def _nullpager(
-    stream: t.TextIO, generator: t.Iterable[str], color: t.Optional[bool]
+    stream: t.TextIO, generator: cabc.Iterable[str], color: bool | None
 ) -> None:
     """Simply print unformatted text.  This is the ultimate fallback."""
     for text in generator:
@@ -454,8 +495,8 @@ def _nullpager(
 class Editor:
     def __init__(
         self,
-        editor: t.Optional[str] = None,
-        env: t.Optional[t.Mapping[str, str]] = None,
+        editor: str | None = None,
+        env: cabc.Mapping[str, str] | None = None,
         require_save: bool = True,
         extension: str = ".txt",
     ) -> None:
@@ -478,18 +519,22 @@ class Editor:
                 return editor
         return "vi"
 
-    def edit_file(self, filename: str) -> None:
+    def edit_files(self, filenames: cabc.Iterable[str]) -> None:
         import subprocess
 
         editor = self.get_editor()
-        environ: t.Optional[t.Dict[str, str]] = None
+        environ: dict[str, str] | None = None
 
         if self.env:
             environ = os.environ.copy()
             environ.update(self.env)
 
+        exc_filename = " ".join(f'"{filename}"' for filename in filenames)
+
         try:
-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+            c = subprocess.Popen(
+                args=f"{editor} {exc_filename}", env=environ, shell=True
+            )
             exit_code = c.wait()
             if exit_code != 0:
                 raise ClickException(
@@ -500,10 +545,18 @@ class Editor:
                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
             ) from e
 
-    def edit(self, text: t.Optional[t.AnyStr]) -> t.Optional[t.AnyStr]:
+    @t.overload
+    def edit(self, text: bytes | bytearray) -> bytes | None: ...
+
+    # We cannot know whether or not the type expected is str or bytes when None
+    # is passed, so str is returned as that was what was done before.
+    @t.overload
+    def edit(self, text: str | None) -> str | None: ...
+
+    def edit(self, text: str | bytes | bytearray | None) -> str | bytes | None:
         import tempfile
 
-        if not text:
+        if text is None:
             data = b""
         elif isinstance(text, (bytes, bytearray)):
             data = text
@@ -532,7 +585,7 @@ class Editor:
             # recorded, so get the new recorded value.
             timestamp = os.path.getmtime(name)
 
-            self.edit_file(name)
+            self.edit_files((name,))
 
             if self.require_save and os.path.getmtime(name) == timestamp:
                 return None
@@ -543,7 +596,7 @@ class Editor:
             if isinstance(text, (bytes, bytearray)):
                 return rv
 
-            return rv.decode("utf-8-sig").replace("\r\n", "\n")  # type: ignore
+            return rv.decode("utf-8-sig").replace("\r\n", "\n")
         finally:
             os.unlink(name)
 
@@ -608,7 +661,7 @@ def open_url(url: str, wait: bool = False, locate: bool = False) -> int:
         return 1
 
 
-def _translate_ch_to_exc(ch: str) -> t.Optional[BaseException]:
+def _translate_ch_to_exc(ch: str) -> None:
     if ch == "\x03":
         raise KeyboardInterrupt()
 
@@ -621,11 +674,11 @@ def _translate_ch_to_exc(ch: str) -> t.Optional[BaseException]:
     return None
 
 
-if WIN:
+if sys.platform == "win32":
     import msvcrt
 
     @contextlib.contextmanager
-    def raw_terminal() -> t.Iterator[int]:
+    def raw_terminal() -> cabc.Iterator[int]:
         yield -1
 
     def getchar(echo: bool) -> str:
@@ -658,12 +711,11 @@ if WIN:
         #
         # Anyway, Click doesn't claim to do this Right(tm), and using `getwch`
         # is doing the right thing in more situations than with `getch`.
-        func: t.Callable[[], str]
 
         if echo:
-            func = msvcrt.getwche  # type: ignore
+            func = t.cast(t.Callable[[], str], msvcrt.getwche)
         else:
-            func = msvcrt.getwch  # type: ignore
+            func = t.cast(t.Callable[[], str], msvcrt.getwch)
 
         rv = func()
 
@@ -675,14 +727,13 @@ if WIN:
         _translate_ch_to_exc(rv)
         return rv
 
-
 else:
-    import tty
     import termios
+    import tty
 
     @contextlib.contextmanager
-    def raw_terminal() -> t.Iterator[int]:
-        f: t.Optional[t.TextIO]
+    def raw_terminal() -> cabc.Iterator[int]:
+        f: t.TextIO | None
         fd: int
 
         if not isatty(sys.stdin):
